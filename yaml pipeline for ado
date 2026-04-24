@@ -1,0 +1,111 @@
+# YAML file for creation of terraform files with 
+trigger:
+- main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  awsRegion: 'us-west-2'
+  terraformVersion: '1.6.6'
+  serviceConnection: 'aws-service-connection'
+  environmentName: 'dev'
+  bucketName: 'tf-state-mycompany'
+
+stages:
+- stage: Plan
+  jobs:
+  - job: TerraformPlan
+    steps:
+      - checkout: self
+      - task: TerraformInstaller@1
+        displayName: Install Terraform
+        inputs:
+          terraformVersion: $(terraformVersion)
+
+      - task: AWSShellScript@1
+        displayName: 'Terraform Init + Plan'
+        inputs:
+          awsCredentials: $(serviceConnection)
+          regionName: $(awsRegion)
+          scriptType: 'inline'
+          inlineScript: |
+            set -e
+            terraform -chdir=env/$(environmentName) init -reconfigure
+            terraform -chdir=env/$(environmentName) validate
+            terraform -chdir=env/$(environmentName) plan -out=tfplan
+
+      # Publish both plan and lock file
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Terraform Plan'
+        inputs:
+          targetPath: env/$(environmentName)/tfplan
+          artifact: terraform-plan
+
+      - task: PublishPipelineArtifact@1
+        displayName: 'Publish Lock File'
+        inputs:
+          targetPath: env/$(environmentName)/.terraform.lock.hcl
+          artifact: terraform-lock
+
+- stage: Approval
+  dependsOn: Plan
+  jobs:
+  - job: ManualApproval
+    pool: server
+    steps:
+      - task: ManualValidation@0
+        inputs:
+          instructions: 'Review the Terraform plan and lock file before approving Apply.'
+
+- stage: Apply
+  dependsOn: Approval
+  jobs:
+  - deployment: TerraformApply
+    environment: $(environmentName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+            - task: TerraformInstaller@1
+              displayName: Install Terraform
+              inputs:
+                terraformVersion: $(terraformVersion)
+
+            # Download both artifacts
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download Terraform Plan'
+              inputs:
+                artifact: terraform-plan
+                path: env/$(environmentName)
+
+            - task: DownloadPipelineArtifact@2
+              displayName: 'Download Lock File'
+              inputs:
+                artifact: terraform-lock
+                path: env/$(environmentName)
+
+            - task: AWSShellScript@1
+              displayName: 'Terraform Apply'
+              inputs:
+                awsCredentials: $(serviceConnection)
+                regionName: $(awsRegion)
+                scriptType: 'inline'
+                inlineScript: |
+                  set -e
+                  terraform -chdir=env/$(environmentName) apply -auto-approve tfplan
+
+- stage: Verify
+  dependsOn: Apply
+  jobs:
+  - job: PostDeployChecks
+    steps:
+      - task: AWSCLI@1
+        displayName: 'Check S3 State Bucket'
+        inputs:
+          awsCredentials: $(serviceConnection)
+          regionName: $(awsRegion)
+          awsCommand: s3
+          awsSubCommand: ls
+          awsArguments: s3://$(bucketName) --recursive
