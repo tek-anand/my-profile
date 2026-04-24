@@ -1,4 +1,4 @@
-# YAML file for creation of terraform files with 
+# YAML file for creation of terraform files with inline script
 trigger:
 - main
 
